@@ -2,9 +2,9 @@
 
 ## What this repo is
 
-One file: `artcraftctl`, a single bash script of about 500 lines. No build step, no dependencies
-beyond the ones listed in `README.md`, no tests directory, no artifacts. Its header comment is the
-reference for internals.
+One shipped file: `artcraftctl`, a single bash script of about 570 lines. No build step, no
+dependencies beyond the ones listed in `README.md`, no artifacts. `tests/run.sh` is an offline
+sandbox suite for it — see *How to test*. Its header comment is the reference for internals.
 
 ## Invariants you must not break
 
@@ -46,6 +46,20 @@ reference for internals.
 
 ## How to test
 
+`bash tests/run.sh` is the suite and runs with no network, no `gh` login and no writes outside a
+temporary prefix: it puts a stub `gh` on `PATH`, builds throwaway release tarballs, and drives the
+real entrypoint in a fresh sandbox per case. 15 cases cover install/update/upgrade/uninstall, the
+two failure modes below, checksum and arch refusal, the manifest prefix guard, and the no-tty path.
+`bash tests/run.sh rollback` runs only the matching cases. Exit 0 means every case passed.
+
+`bash tests/mutation-check.sh` proves the suite has teeth: it removes one guard at a time from a
+copy of `artcraftctl` and requires a named case to fail. Dev-only, not a gate — run it whenever the
+install, rollback or prune logic changes, because a case that passes for the wrong reason looks
+exactly like a case that passes for the right one.
+
+Against real releases (needs `gh auth status` to be logged in), the manual recipe is still the
+honest end-to-end check:
+
 ```sh
 SANDBOX=$(mktemp -d)
 export ARTCRAFT_CONFIG_DIR=$SANDBOX/config ARTCRAFT_DATA_DIR=$SANDBOX/data \
@@ -62,7 +76,9 @@ Run `gh auth status` first. Prompts need a real terminal, so drive `init` in `tm
 host; a non-tty run is report-only, since confirmations are skipped. Check the side effect
 (installed files, state files, leftovers) rather than only the pane text.
 
-Two cases worth forcing, because they are the ones a refactor breaks:
+Two cases worth forcing, because they are the ones a refactor breaks. Both are automated cases in
+`tests/run.sh` (`upgrade_rolls_back_*`, `upgrade_replaces_and_prunes_orphans`); the manual forms
+below are for checking a real release end to end:
 
 - **Rollback**: install an app, then `chmod a-w` the destination directory and run `upgrade` with
   an older version written into `state/<app>`. Expect `could not place the files — rolling back`,
@@ -72,10 +88,14 @@ Two cases worth forcing, because they are the ones a refactor breaks:
 
 ## Quality gates
 
-- `shellcheck -S style artcraftctl` is the gate and must be clean — no exceptions. Older copies of
-  this script carried an SC2318 in `_remove_files` (a single `local app=… manifest=…` that relied
-  on the caller's `app`); it is fixed by splitting the declaration, so do not reintroduce the
-  pattern.
+- `bash tests/run.sh` must pass (15 cases, offline, no token needed). It is the gate for behaviour:
+  the transactional install, the rollback, orphan pruning, checksum/arch refusal and the manifest
+  prefix guard each have a case, and `.github/workflows/ci.yml` runs it on every push to `master`
+  and every pull request.
+- `shellcheck -S style artcraftctl tests/run.sh` is the gate and must be clean — no exceptions.
+  Older copies of this script carried an SC2318 in `_remove_files` (a single `local app=…
+  manifest=…` that relied on the caller's `app`); it is fixed by splitting the declaration, so do
+  not reintroduce the pattern.
 - `shfmt` is **not** a gate today: the file is hand-formatted (aligned one-line helpers, trailing
   comments) and `shfmt -d` rewrites most of it. If you reformat, do it in its own commit with no
   behaviour change.
