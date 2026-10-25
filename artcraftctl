@@ -2,8 +2,8 @@
 # artcraftctl — installer / updater for the ArtCraft suite (storytold/*).
 #
 # Downloads unmodified release tarballs from GitHub releases and installs their
-# bin/ into ~/.local/bin and share/ into ~/.local/share. Uses gum for UI and gh
-# for GitHub access (no scraping).
+# bin/ into ~/.local/bin and share/ into ~/.local/share. Plain ANSI output and gh
+# for GitHub access: no TUI library, no scraping.
 #
 # Commands:
 #   artcraftctl update    --app APP | --all   Check installed vs latest release (report only)
@@ -20,6 +20,11 @@
 #           ~/.local/share/artcraftctl/state/<app>.files    manifest of installed files
 #
 # All paths honour XDG_* and can be overridden with ARTCRAFT_* env vars (testing).
+#
+# An install stages the payload on the destination filesystem and then renames each
+# file into place, keeping the previous file in a backup directory until the whole
+# set has landed. A failed or interrupted install is rolled back instead of leaving
+# a half-installed app behind.
 
 set -euo pipefail
 
@@ -37,52 +42,50 @@ SHARE_DIR="${ARTCRAFT_SHARE_DIR:-$HOME/.local/share}"
 ARCH="${ARTCRAFT_ARCH:-linux-$(uname -m)}"
 
 # --------------------------------------------------------------- ui helpers --
-head_()  { gum style --foreground 212 --bold "$*"; }
-info_()  { gum log --level info  "$*"; }
-warn_()  { gum log --level warn  "$*"; }
-err_()   { gum log --level error "$*"; }
-ok_()    { gum log --level info  "$*"; }
+# Colour is emitted only when someone is looking: a tty on stdout or stderr, no
+# NO_COLOR in the environment, and not a dumb terminal. Everything with a
+# diagnostic meaning goes to stderr, so `artcraftctl update > report` still shows
+# the status lines and help stays the only thing on stdout.
+if [[ -t 1 || -t 2 ]] && [[ -z "${NO_COLOR:-}" ]] && [[ "${TERM:-dumb}" != dumb ]]; then
+  C_HEAD=$'\033[38;5;212;1m'
+  C_OK=$'\033[32m'
+  C_INFO=$'\033[36m'
+  C_WARN=$'\033[33m'
+  C_ERR=$'\033[31m'
+  C_B=$'\033[1m'
+  C_0=$'\033[0m'
+else
+  C_HEAD=""; C_OK=""; C_INFO=""; C_WARN=""; C_ERR=""; C_B=""; C_0=""
+fi
+
+head_()  { printf '%s%s%s\n' "$C_HEAD" "$*" "$C_0" >&2; }
+info_()  { printf '%sINFO%s  %s\n' "$C_INFO" "$C_0" "$*" >&2; }
+ok_()    { printf '%sOK%s    %s\n' "$C_OK" "$C_0" "$*" >&2; }
+warn_()  { printf '%sWARN%s  %s\n' "$C_WARN" "$C_0" "$*" >&2; }
+err_()   { printf '%sERROR%s %s\n' "$C_ERR" "$C_0" "$*" >&2; }
 die()    { err_ "$*"; exit 1; }
 need()   { command -v "$1" >/dev/null 2>&1 || die "required tool not found: $1"; }
 
-interactive() { [[ -t 0 && -t 1 ]]; }          # a real terminal (gum confirm needs one)
-ask_confirm() { interactive && gum_confirm "$1"; }
+# A prompt needs a real terminal on both ends. Read from /dev/tty, not stdin:
+# these run under $( ) where stdin is the pipe, and a report-only run (cron, ssh)
+# must never block.
+interactive() { [[ -t 0 || -r /dev/tty ]]; }
 
-# gum (bubbletea v2) probes the terminal for capabilities on startup — DECRQM
-# (`\e[?2026$p`, `\e[?2027$p`) and the kitty-keyboard query (`\e[?u`). Terminals that
-# answer (e.g. Ghostty) reply on the tty, e.g. `2026;2$y2027;2$y1u`. Two leaks follow:
-#   * the reply reaches the shell prompt as stray input -> fixed by draining the tty;
-#   * the reply is ECHOED to the screen if it arrives while the tty still has echo on
-#     (gum only switches to raw mode *after* it has sent the queries) -> fixed by turning
-#     echo off around the invocation and restoring the exact prior state afterwards.
-# There is no env var or flag to stop the probe (TERM=dumb still emits it on gum 2.0.0).
-# We hold echo off for the WHOLE run and drain at exit, so a reply that lands anywhere in
-# the window can be neither echoed nor left in the input buffer.
-_drain_settle() {   # read and discard anything pending on the controlling tty
-  [[ -t 0 && -r /dev/tty ]] || return 0
-  local _junk quiet=0
-  while :; do
-    if IFS= read -r -t 0.06 -n 512 _junk 2>/dev/null < /dev/tty; then quiet=0
-    else quiet=$((quiet + 1)); [[ $quiet -ge 2 ]] && break; fi
-  done
+confirm() {  # QUESTION -> 0 = yes. No terminal, or an empty answer, means no.
+  local reply=""
+  interactive || return 1
+  printf '%s [y/N] ' "$1" >&2
+  IFS= read -r reply < /dev/tty || return 1
+  [[ "$reply" == [yY]* ]]
 }
-_TERM_SAVED=""
-_tty_hold() {       # echo off, saved state kept for restore
-  [[ -t 0 && -r /dev/tty ]] || return 0
-  _TERM_SAVED="$(stty -g < /dev/tty 2>/dev/null)" || { _TERM_SAVED=""; return 0; }
-  stty -echo < /dev/tty 2>/dev/null || true
+
+ask() {  # QUESTION -> the answer on stdout; empty when there is no terminal
+  local reply=""
+  if ! interactive; then printf '\n'; return 0; fi
+  printf '%s ' "$1" >&2
+  IFS= read -r reply < /dev/tty || true
+  printf '%s\n' "$reply"
 }
-_tty_release() {    # drain a late reply, then restore the tty exactly
-  [[ -n "$_TERM_SAVED" ]] || return 0
-  _drain_settle
-  stty "$_TERM_SAVED" < /dev/tty 2>/dev/null || true
-  _TERM_SAVED=""
-}
-_gum_guard() { "$@"; local rc=$?; _drain_settle; return $rc; }
-gum_spin()    { _gum_guard gum spin "$@"; }
-gum_choose()  { _gum_guard gum choose "$@"; }
-gum_input()   { _gum_guard gum input "$@"; }
-gum_confirm() { _gum_guard gum confirm "$@"; }
 
 # ------------------------------------------------------------ config/state --
 read_config() {   # print every clean "owner/repo" line, one per line
@@ -168,6 +171,18 @@ _desktop_db_refresh() {
   fi
 }
 
+_clean_desktop_caches() {  # drop caches that only existed for the files we removed
+  local apps="$SHARE_DIR/applications" icons="$SHARE_DIR/icons/hicolor"
+  # update-desktop-database leaves a cache behind even when no .desktop is left;
+  # only drop it once nothing else in that directory needs it.
+  if [[ -f "$apps/mimeinfo.cache" ]] && ! compgen -G "$apps/*.desktop" >/dev/null 2>&1; then
+    rm -f "$apps/mimeinfo.cache"
+  fi
+  if [[ -f "$icons/icon-theme.cache" ]] && ! compgen -G "$icons/*/*" >/dev/null 2>&1; then
+    rm -f "$icons/icon-theme.cache"
+  fi
+}
+
 _prune_parents() {  # PATH... -> remove now-empty ancestor dirs below BIN_DIR/SHARE_DIR
   local p d list=()
   for p in "$@"; do
@@ -243,8 +258,8 @@ _stage_release() {  # repo tag tmp -> verified tree in $tmp/x, asset name in _AS
   app="$(repo_basename "$repo")"
 
   _ASSET="$(pick_asset "$repo" "$tag")" || return 1
-  gum_spin --spinner dot --title "Downloading $_ASSET ..." -- \
-    gh release download "$tag" -R "$repo" -p "$_ASSET" -D "$tmp" \
+  info_ "$app: downloading $_ASSET"
+  gh release download "$tag" -R "$repo" -p "$_ASSET" -D "$tmp" \
     || { err_ "$repo: download failed"; return 1; }
   gh release download "$tag" -R "$repo" -p 'SHA256SUMS.txt' -D "$tmp" >/dev/null 2>&1 || true
 
@@ -256,7 +271,7 @@ _stage_release() {  # repo tag tmp -> verified tree in $tmp/x, asset name in _AS
   [[ -n "$sum" ]] || { err_ "$app: no checksum entry for $_ASSET in SHA256SUMS.txt"; return 1; }
   ( cd "$tmp" && printf '%s\n' "$sum" | sha256sum -c - >/dev/null ) \
     || { err_ "$app: checksum verification FAILED - not installing"; return 1; }
-  info_ "$app: checksum verified"
+  ok_ "$app: checksum verified"
 
   mkdir -p "$tmp/x"
   tar xzf "$tmp/$_ASSET" -C "$tmp/x" --strip-components=1 \
@@ -264,23 +279,102 @@ _stage_release() {  # repo tag tmp -> verified tree in $tmp/x, asset name in _AS
   [[ -d "$tmp/x/bin" ]] || { err_ "$app: tarball has no bin/ directory"; return 1; }
 }
 
-_install_staged() {  # repo ver tmp -> copy the staged tree into place, record state
+_install_staged() {  # repo ver tmp -> place the staged tree transactionally
   local repo="$1" ver="$2" tmp="$3" app
   app="$(repo_basename "$repo")"
-
+  local old_manifest="$STATE_DIR/$app.files"
   mkdir -p "$BIN_DIR" "$SHARE_DIR" "$STATE_DIR"
-  cp -a "$tmp/x/bin/." "$BIN_DIR/"
-  if [[ -d "$tmp/x/share" ]]; then cp -a "$tmp/x/share/." "$SHARE_DIR/"; fi
+
+  # Leftovers from a killed run are useless; a day is well past any real install.
+  find "$DATA_DIR" -maxdepth 1 -type d \( -name '.stage.*' -o -name '.backup.*' \) -mtime +0 \
+    -exec rm -rf {} + 2>/dev/null || true
+
+  # Same filesystem as the payload, because rename() across filesystems is a copy
+  # and a copy is exactly what we must not depend on.
+  local stage backup
+  stage="$(mktemp -d "$DATA_DIR/.stage.XXXXXX")"
+  backup="$(mktemp -d "$DATA_DIR/.backup.XXXXXX")"
+
+  # 1. build the payload next to its destination
+  mkdir -p "$stage/bin"
+  cp -a "$tmp/x/bin/." "$stage/bin/"
+  if [[ -d "$tmp/x/share" ]]; then
+    mkdir -p "$stage/share"
+    cp -a "$tmp/x/share/." "$stage/share/"
+  fi
+
+  # 2. move it in, one file at a time, keeping the replaced file in the backup
+  local -a rels=() placed=()
+  while IFS= read -r rel; do rels+=("$rel"); done < <(
+    cd "$stage" && { if [[ -d share ]]; then find bin share -type f; else find bin -type f; fi; } | sort
+  )
+  if [[ ${#rels[@]} -eq 0 ]]; then
+    rm -rf "$stage" "$backup"
+    err_ "$app: nothing to install in the tarball"; return 1
+  fi
+
+  local rel src dst bslot ok=1 i
+  for rel in "${rels[@]}"; do
+    case "$rel" in
+      bin/*)   src="$stage/$rel"; dst="$BIN_DIR/${rel#bin/}";;
+      share/*) src="$stage/$rel"; dst="$SHARE_DIR/${rel#share/}";;
+      *)       continue;;
+    esac
+    bslot="$backup/$rel"
+    mkdir -p "$(dirname "$dst")" || { ok=0; break; }
+    if [[ -e "$dst" ]]; then
+      mkdir -p "$(dirname "$bslot")" || { ok=0; break; }
+      mv -f "$dst" "$bslot" || { ok=0; break; }
+    fi
+    mv -f "$src" "$dst" || { ok=0; break; }
+    placed+=("$dst")
+  done
+
+  # 3. roll back if anything refused to land
+  if [[ $ok -eq 0 ]]; then
+    err_ "$app: could not place the files — rolling back"
+    for (( i = ${#placed[@]} - 1; i >= 0; i-- )); do rm -f "${placed[i]}"; done
+    while IFS= read -r rel; do
+      [[ -z "$rel" ]] && continue
+      case "$rel" in
+        bin/*)   dst="$BIN_DIR/${rel#bin/}";;
+        share/*) dst="$SHARE_DIR/${rel#share/}";;
+        *)       continue;;
+      esac
+      mkdir -p "$(dirname "$dst")" && mv -f "$backup/$rel" "$dst" || true
+    done < <( cd "$backup" && find . -type f -printf '%P\n' | sort )
+    _prune_parents "${placed[@]:-}"
+    rm -rf "$stage" "$backup"
+    return 1
+  fi
+
+  # 4. drop files the previous version had and this one does not. Only paths inside
+  # the install prefixes are touched, whatever the old manifest says.
+  local -a orphans=()
+  if [[ -f "$old_manifest" ]]; then
+    local -A is_new=()
+    for dst in "${placed[@]}"; do is_new["$dst"]=1; done
+    while IFS= read -r rel || [[ -n "$rel" ]]; do
+      [[ -z "$rel" ]] && continue
+      case "$rel" in
+        "$BIN_DIR"/*|"$SHARE_DIR"/*) ;;
+        *) warn_ "$app: ignoring manifest entry outside the install prefixes: $rel"; continue;;
+      esac
+      [[ -n "${is_new[$rel]:-}" ]] && continue
+      if [[ -e "$rel" ]]; then rm -f "$rel" && orphans+=("$rel"); fi
+    done < "$old_manifest"
+  fi
+
+  # 5. record state. Both files are written aside and renamed into place, so a
+  # reader never sees a half-written manifest.
+  printf '%s\n' "${placed[@]}" > "$STATE_DIR/.$app.files.new"
+  mv -f "$STATE_DIR/.$app.files.new" "$STATE_DIR/$app.files"
+  printf '%s\n' "$ver" > "$STATE_DIR/.$app.new"
+  mv -f "$STATE_DIR/.$app.new" "$STATE_DIR/$app"
   if [[ -e "$BIN_DIR/$app" ]]; then chmod +x "$BIN_DIR/$app" 2>/dev/null || true; fi
 
-  # manifest of installed files (absolute paths) so uninstall is exact
-  : > "$STATE_DIR/$app.files"
-  ( cd "$tmp/x" && find bin -type f -printf "$BIN_DIR/%P\n" ) >> "$STATE_DIR/$app.files"
-  if [[ -d "$tmp/x/share" ]]; then
-    ( cd "$tmp/x" && find share -type f -printf "$SHARE_DIR/%P\n" ) >> "$STATE_DIR/$app.files"
-  fi
-  printf '%s\n' "$ver" > "$STATE_DIR/$app"
-
+  rm -rf "$stage" "$backup"
+  [[ ${#orphans[@]} -gt 0 ]] && _prune_parents "${orphans[@]}"
   _desktop_db_refresh
 }
 
@@ -319,6 +413,12 @@ _remove_files() {  # APP -> print the paths it removed
   if [[ -f "$manifest" ]]; then
     while IFS= read -r f || [[ -n "$f" ]]; do
       [[ -z "$f" ]] && continue
+      # The manifest is a plain file in the user's own data dir, so never trust it
+      # to name a path outside the two prefixes this tool installs into.
+      case "$f" in
+        "$BIN_DIR"/*|"$SHARE_DIR"/*) ;;
+        *) warn_ "$app: ignoring manifest entry outside the install prefixes: $f"; continue;;
+      esac
       if [[ -e "$f" ]]; then rm -f "$f" && printf '%s\n' "$f"; fi
     done < "$manifest"
   else
@@ -339,8 +439,11 @@ uninstall_one() {  # owner/repo [--quiet]
   rm -f "$STATE_DIR/$app" "$STATE_DIR/$app.files"
   _prune_parents "${removed[@]:-}"
   _desktop_db_refresh
-  # the refresh can delete a now-empty icon-theme cache, leaving dirs empty again
-  _prune_parents "${removed[@]:-}"
+  # Regenerating the desktop caches can resurrect a cache for files that are gone,
+  # and can leave directories empty that the first prune had already removed.
+  _clean_desktop_caches
+  _prune_parents "${removed[@]:-}" \
+    "$SHARE_DIR/applications/mimeinfo.cache" "$SHARE_DIR/icons/hicolor/icon-theme.cache"
   [[ "$quiet" == "--quiet" ]] || ok_ "$app: uninstalled (${#removed[@]} file(s) removed)"
 }
 
@@ -372,18 +475,15 @@ upgrade_one() {  # owner/repo
   fi
 
   info_ "$app: upgrading ${inst:-?} -> $ver"
-  # Stage first. A failed download, a missing checksum or a bad tarball must leave
-  # the installed version exactly as it was, so the removal happens only after the
-  # replacement is verified and unpacked.
+  # Stage first, then replace in place. There is no removal step: the replaced files
+  # are kept as a backup until the whole set has landed, so a failed download, a bad
+  # checksum or a copy that cannot complete leaves the old version working.
   tmp="$(mktemp -d)"
   if ! _stage_release "$repo" "$tag" "$tmp"; then
     rm -rf "$tmp"; err_ "$app: upgrade aborted, the installed version was left in place"; return 1
   fi
-  if ! uninstall_one "$repo" --quiet; then
-    rm -rf "$tmp"; err_ "$app: could not remove the old version"; return 1
-  fi
   if ! _install_staged "$repo" "$ver" "$tmp"; then
-    rm -rf "$tmp"; err_ "$app: files could not be installed after the old version was removed"; return 1
+    rm -rf "$tmp"; err_ "$app: upgrade failed and was rolled back; $app is still at ${inst:-its previous version}"; return 1
   fi
   rm -rf "$tmp"
   ok_ "$app: upgraded to $ver"
@@ -401,21 +501,20 @@ cmd_upgrade() {
 cmd_init() {
   head_ "artcraftctl init — one-time setup"
   if [[ -f "$CONFIG_FILE" ]]; then
-    ask_confirm "Config already exists at $CONFIG_FILE. Add more repos?" \
+    confirm "Config already exists at $CONFIG_FILE. Add more repos?" \
       || { info_ "keeping existing config"; return 0; }
   fi
   mkdir -p "$CONFIG_DIR"
   local added=0 input
   while true; do
-    input="$(gum_input --header "Repo to track" \
-              --placeholder "owner/repo (e.g. storytold/photocraft)" || true)"
+    input="$(ask 'Repo to track (owner/repo, empty to finish):')"
     input="$(printf '%s' "$input" | tr -d '[:space:]')"
     [[ -z "$input" ]] && break
     if [[ "$input" != */* || "$input" == */*/* ]]; then
       warn_ "use owner/repo format (got '$input')"; continue
     fi
-    if gum_spin --spinner dot --title "Checking $input ..." -- \
-         gh api "repos/$input" --jq '.full_name' >/dev/null 2>&1; then
+    info_ "checking $input"
+    if gh api "repos/$input" --jq '.full_name' >/dev/null 2>&1; then
       if [[ -f "$CONFIG_FILE" ]] && grep -qxF "$input" "$CONFIG_FILE"; then
         info_ "$input already in config"
       else
@@ -426,7 +525,7 @@ cmd_init() {
     else
       err_ "$input: not found (or no access)"
     fi
-    ask_confirm "Add another repo?" || break
+    confirm "Add another repo?" || break
   done
   if [[ $added -gt 0 ]]; then
     ok_ "config written to $CONFIG_FILE ($added repo(s) added)"
@@ -437,32 +536,26 @@ cmd_init() {
 
 # ------------------------------------------------------------------- help ----
 usage() {
-  gum style --foreground 212 --bold "artcraftctl — installer / updater for the ArtCraft suite"
-  printf '\n'
-  gum format <<'EOF'
-**Usage**  (`APP` = app name, resolved via the config, or `owner/repo`)
-
-- `artcraftctl update    --app APP | --all`  check installed vs the latest release (no changes)
-- `artcraftctl upgrade   --app APP | --all`  update an installed app to the latest release
-- `artcraftctl install   --app APP | --all`  install an app (refuses if already installed)
-- `artcraftctl uninstall --app APP | --all`  remove an installed app
-- `artcraftctl init`                         interactive one-time setup; writes the config file
-- `artcraftctl help`                         this help
-
-**Paths**
-
-- Config    `~/.config/artcraftctl/config` — one `owner/repo` per line (`#` comments allowed)
-- Version   `~/.local/share/artcraftctl/state/<app>`
-- Manifest  `~/.local/share/artcraftctl/state/<app>.files`
-- Targets   `bin/` → `~/.local/bin` · `share/` → `~/.local/share`
-EOF
+  {
+    printf '%sartcraftctl%s — installer / updater for the ArtCraft suite\n\n' "$C_HEAD" "$C_0"
+    printf '%sAPP%s is an app name (resolved via the config) or owner/repo.\n\n' "$C_B" "$C_0"
+    printf '  artcraftctl update    %s--app APP | --all%s   check installed vs latest (no changes)\n' "$C_B" "$C_0"
+    printf '  artcraftctl upgrade   %s--app APP | --all%s   update an installed app to the latest release\n' "$C_B" "$C_0"
+    printf '  artcraftctl install   %s--app APP | --all%s   install an app (refuses if already installed)\n' "$C_B" "$C_0"
+    printf '  artcraftctl uninstall %s--app APP | --all%s   remove an installed app\n' "$C_B" "$C_0"
+    printf '  artcraftctl init                          interactive setup; writes the config file\n'
+    printf '  artcraftctl help                          this help\n\n'
+    printf '%sPaths%s\n\n' "$C_B" "$C_0"
+    printf '  Config    ~/.config/artcraftctl/config             one owner/repo per line\n'
+    printf '  Version   ~/.local/share/artcraftctl/state/<app>\n'
+    printf '  Manifest  ~/.local/share/artcraftctl/state/<app>.files\n'
+    printf '  Targets   bin/ -> ~/.local/bin, share/ -> ~/.local/share\n'
+  }
 }
 
 # ------------------------------------------------------------------- main ----
 main() {
-  need gum; need gh; need tar; need sha256sum
-  trap _tty_release EXIT INT TERM HUP
-  _tty_hold
+  need gh; need tar; need sha256sum; need find; need awk; need sort; need grep
   local cmd="${1:-}"; shift || true
   case "$cmd" in
     update)    cmd_update "$@";;

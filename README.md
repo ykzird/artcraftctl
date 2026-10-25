@@ -66,24 +66,42 @@ An app counts as installed if its state file exists or its binary is executable 
 
 These paths honour `XDG_CONFIG_HOME` and `XDG_DATA_HOME`, and can be pointed elsewhere for
 testing with `ARTCRAFT_CONFIG_DIR`, `ARTCRAFT_DATA_DIR`, `ARTCRAFT_BIN_DIR` and
-`ARTCRAFT_SHARE_DIR`; `ARTCRAFT_ARCH` overrides the release suffix taken from `uname -m`. After an install or uninstall, `update-desktop-database` and
-`gtk-update-icon-cache` run when present, so launchers pick up changes without a re-login.
+`ARTCRAFT_SHARE_DIR`; `ARTCRAFT_ARCH` overrides the release suffix taken from `uname -m`.
+
+After an install or uninstall, `update-desktop-database` and `gtk-update-icon-cache` run when
+present, so launchers pick up changes without a re-login. An install also needs temporary space
+next to the payload: `.stage.XXXXXX` and `.backup.XXXXXX` directories appear inside the data
+directory for the duration of a run and are removed when it ends.
 
 ## Requirements
 
 - Linux on x86_64, aarch64 or riscv64 — the release has to publish a tarball for the architecture
   `uname -m` reports (override with `ARTCRAFT_ARCH`)
-- bash 4 or newer (`mapfile`)
-- `gum` for the terminal UI. It is checked before the command is parsed, so `help` needs it too,
-  and without it you get a bare `gum: command not found` rather than the tool's own error
+- bash 4 or newer (`mapfile`, associative arrays)
 - `gh`, authenticated, with a token that can read the tracked repos
 - `tar`, `sha256sum`, plus coreutils, `awk`, `sort` and `find`
 - optional: `update-desktop-database`, `gtk-update-icon-cache`
+- no TUI library: colour is plain ANSI, switched off when output is not a terminal or
+  `NO_COLOR` is set
+
+## How an install lands
+
+Every install, and every upgrade, goes through the same three steps:
+
+1. The tarball is downloaded and unpacked in a temporary directory, and the checksum of the
+   archive is verified before anything is touched.
+2. The payload is copied into a staging directory that lives on the same filesystem as
+   `~/.local` (a rename across filesystems is a copy, so it could not be atomic).
+3. Each file is renamed into place, and the file it replaces is kept in a backup directory until
+   every file has landed. If any step fails, the placed files are removed and the backups are
+   moved back, so a failed install leaves the previous version working rather than half-written.
+
+Files that the previous version had and the new one no longer ships are removed after the new set
+is in place. The manifest and the version file are written to a temporary name and renamed, so a
+reader never sees a half-written manifest.
 
 ## Known limitations
 
-- `uninstall` removes what the manifest lists, not caches that other tools generate, such as
-  `~/.local/share/applications/mimeinfo.cache`.
 - An app deleted by hand still counts as installed: its state and manifest files remain until
   you remove them.
 - Without a manifest, `uninstall` falls back to deleting `~/.local/bin/<app>` and
@@ -93,9 +111,8 @@ testing with `ARTCRAFT_CONFIG_DIR`, `ARTCRAFT_DATA_DIR`, `ARTCRAFT_BIN_DIR` and
   several of those, it stops and lists them instead of guessing.
 - A release without `SHA256SUMS.txt`, or without an entry for the chosen asset, is refused. There
   is no flag to install without a checksum.
-- `upgrade` stages and verifies the new version before it touches the old one, so a failed
-  download or a bad checksum leaves your install intact. The copy itself is not atomic: an
-  interrupted copy after that point can leave a half-installed app.
+- Manifest entries outside `~/.local/bin` and `~/.local/share` are ignored with a warning; they are
+  never deleted.
 - `sync` is gone. It was split into `update` (check) and `upgrade` (apply), and the tool exits
   with a hint if you still type it.
 
@@ -116,8 +133,11 @@ rm -rf ~/.config/artcraftctl ~/.local/share/artcraftctl
 ```
 
 Installed apps stay where they are, so run `artcraftctl uninstall` first if you want them gone
-too. For internals (the release contract, the gum terminal handling, the order of the uninstall
-and upgrade steps) read the header comment and the section banners in the script.
+too. `uninstall` also drops the desktop caches it caused to be generated
+(`applications/mimeinfo.cache`, `icons/hicolor/icon-theme.cache`) once nothing else in those
+directories needs them, and prunes the directories it emptied. For internals (the release
+contract, the transaction in `_install_staged`) read the header comment and the section banners
+in the script.
 
 ## License
 
