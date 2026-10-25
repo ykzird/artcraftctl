@@ -8,8 +8,14 @@ vendored, no tests directory, no artifacts. Its header comment is the reference 
 ## Invariants you must not break
 
 - **Release contract.** Latest stable release from `gh api repos/<owner>/<repo>/releases/latest`;
-  asset `<repo>-<version>-linux-x86_64.tar.gz` plus `SHA256SUMS.txt` in that release; the
-  tarball wraps one top directory with `bin/` and `share/`, extracted `--strip-components=1`.
+  the tarball is *picked from the release's asset list* (`<repo>-<version>-<arch>.tar.gz` first,
+  else the release's other tarball for that version and arch, skipping `-cli-`), never composed
+  from the repo name; `SHA256SUMS.txt` is mandatory; the tarball wraps one top directory with
+  `bin/` and `share/`, extracted `--strip-components=1`.
+- **Architecture.** `ARCH` comes from `uname -m` (`ARTCRAFT_ARCH` overrides it). Never hardcode an
+  arch suffix: a wrong-arch tarball downloads and installs successfully and then cannot run.
+- **Install order.** `_stage_release` (pick, download, verify, extract) always runs before anything
+  is removed or copied, so `upgrade` cannot lose the installed app on a failed download.
 - **Paths.** Config `~/.config/artcraftctl/config`; state `<data>/artcraftctl/state/<app>`
   (version) and `<app>.files` (absolute-path manifest); `bin/` to `~/.local/bin`, `share/` to
   `~/.local/share`. All honour `XDG_*` and the four `ARTCRAFT_*` overrides.
@@ -48,10 +54,10 @@ effect (installed files, state files) rather than only the pane text.
 
 ## Quality gates
 
-- `shellcheck -S style artcraftctl` is the gate: it must stay clean apart from SC2318 in
-  `_remove_files`, where `local app="$1" manifest="$STATE_DIR/$app.files"` expands `$app` before
-  the assignment lands and only resolves because the caller has `app` in scope. Split it into two
-  `local` lines when you touch that function; do not rely on dynamic scope in new code.
+- `shellcheck -S style artcraftctl` is the gate and must be clean — no exceptions. Older copies of
+  this script carried an SC2318 in `_remove_files` (a single `local app=… manifest=…` that relied
+  on the caller's `app`); it is fixed by splitting the declaration, so do not reintroduce the
+  pattern.
 - `shfmt` is **not** a gate today: the file is hand-formatted (aligned one-line helpers, trailing
   comments) and `shfmt -d` rewrites most of it. If you reformat, do it in its own commit with no
   behaviour change.
@@ -59,5 +65,6 @@ effect (installed files, state files) rather than only the pane text.
 ## Do not
 
 - Commit config, state or manifest files; they live in the user's home, not here.
-- Add a LICENSE or CHANGELOG the owner has not chosen.
+- Change the licence. The repo is Apache-2.0 (`LICENSE`) to match the Craft apps; do not add a
+  second one or a CHANGELOG nobody asked for.
 - Add telemetry, analytics, or network access beyond `gh` and the release assets.

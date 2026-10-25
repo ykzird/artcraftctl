@@ -4,10 +4,14 @@
 [storytold](https://github.com/storytold) GitHub organisation (photocraft, vectorcraft,
 lightcraft, filmcraft, effectcraft, designcraft, pdfcraft, gridcraft, deckcraft, soundcraft,
 wordcraft, cadcraft and the rest). GitHub releases are the source of truth. The tool asks the
-API for the latest stable release, downloads the published tarball unmodified, checks it against
-the release's `SHA256SUMS.txt` when one is published, and unpacks it into your home directory. No
-build step, no scraping, no package manager, no daemon: one command installs one app, another
-tells you whether it is still current.
+API for the latest stable release, picks the tarball for this machine's architecture out of that
+release, verifies it against the release's `SHA256SUMS.txt` — and refuses to install anything it
+cannot verify — then unpacks it into your home directory. No build step, no scraping, no package
+manager, no daemon: one command installs one app, another tells you whether it is still current.
+
+This is a third-party installer, not an official ArtCraft product: the apps belong to the
+`storytold` organisation and carry their own licence (Apache-2.0). This tool ships only the
+download-and-place logic, under the same licence.
 
 ## Quick start
 
@@ -62,12 +66,13 @@ An app counts as installed if its state file exists or its binary is executable 
 
 These paths honour `XDG_CONFIG_HOME` and `XDG_DATA_HOME`, and can be pointed elsewhere for
 testing with `ARTCRAFT_CONFIG_DIR`, `ARTCRAFT_DATA_DIR`, `ARTCRAFT_BIN_DIR` and
-`ARTCRAFT_SHARE_DIR`. After an install or uninstall, `update-desktop-database` and
+`ARTCRAFT_SHARE_DIR`; `ARTCRAFT_ARCH` overrides the release suffix taken from `uname -m`. After an install or uninstall, `update-desktop-database` and
 `gtk-update-icon-cache` run when present, so launchers pick up changes without a re-login.
 
 ## Requirements
 
-- Linux x86_64
+- Linux on x86_64, aarch64 or riscv64 — the release has to publish a tarball for the architecture
+  `uname -m` reports (override with `ARTCRAFT_ARCH`)
 - bash 4 or newer (`mapfile`)
 - `gum` for the terminal UI. It is checked before the command is parsed, so `help` needs it too,
   and without it you get a bare `gum: command not found` rather than the tool's own error
@@ -77,21 +82,20 @@ testing with `ARTCRAFT_CONFIG_DIR`, `ARTCRAFT_DATA_DIR`, `ARTCRAFT_BIN_DIR` and
 
 ## Known limitations
 
-- `ARCH` is hardcoded to `linux-x86_64`. Releases also ship aarch64 and riscv64 builds; this
-  tool will not fetch them.
-- The asset filename comes from the repository name, `<repo>-<version>-linux-x86_64.tar.gz`. A
-  repo that publishes another prefix (`craft-launcher` ships `artcraft-launcher-<version>-...`)
-  fails with `asset ... not found`.
-- `upgrade` is uninstall followed by install. If the download fails after the old version is
-  removed, the app is gone; the tool says so when it happens.
-- A release without `SHA256SUMS.txt` only produces a warning, and the tarball is installed
-  unverified.
 - `uninstall` removes what the manifest lists, not caches that other tools generate, such as
   `~/.local/share/applications/mimeinfo.cache`.
 - An app deleted by hand still counts as installed: its state and manifest files remain until
   you remove them.
 - Without a manifest, `uninstall` falls back to deleting `~/.local/bin/<app>` and
   `~/.local/bin/<app>-*` and leaves the rest of the files behind.
+- The asset picker prefers `<repo>-<version>-<arch>.tar.gz` and otherwise takes the release's
+  other tarball for that version and architecture, skipping `-cli-` builds. If a release carries
+  several of those, it stops and lists them instead of guessing.
+- A release without `SHA256SUMS.txt`, or without an entry for the chosen asset, is refused. There
+  is no flag to install without a checksum.
+- `upgrade` stages and verifies the new version before it touches the old one, so a failed
+  download or a bad checksum leaves your install intact. The copy itself is not atomic: an
+  interrupted copy after that point can leave a half-installed app.
 - `sync` is gone. It was split into `update` (check) and `upgrade` (apply), and the tool exits
   with a hint if you still type it.
 
@@ -114,3 +118,8 @@ rm -rf ~/.config/artcraftctl ~/.local/share/artcraftctl
 Installed apps stay where they are, so run `artcraftctl uninstall` first if you want them gone
 too. For internals (the release contract, the gum terminal handling, the order of the uninstall
 and upgrade steps) read the header comment and the section banners in the script.
+
+## License
+
+Apache-2.0, see [LICENSE](LICENSE). The Craft apps are licensed by the `storytold` project
+owners, not by this repository.

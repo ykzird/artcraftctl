@@ -30,7 +30,11 @@ DATA_DIR="${ARTCRAFT_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/artcraftctl}
 STATE_DIR="$DATA_DIR/state"
 BIN_DIR="${ARTCRAFT_BIN_DIR:-$HOME/.local/bin}"
 SHARE_DIR="${ARTCRAFT_SHARE_DIR:-$HOME/.local/share}"
-ARCH="linux-x86_64"
+# Release asset suffix. Every release publishes one tarball per architecture, so
+# this follows the machine: a hardcoded x86_64 suffix downloads and installs a
+# binary that cannot run here, and still reports success. ARTCRAFT_ARCH overrides
+# it for testing.
+ARCH="${ARTCRAFT_ARCH:-linux-$(uname -m)}"
 
 # --------------------------------------------------------------- ui helpers --
 head_()  { gum style --foreground 212 --bold "$*"; }
@@ -136,6 +140,7 @@ ver_gt() {  # A B -> true when A is a higher version than B
 
 # --------------------------------------------------------- target selecting --
 _TARGET=()
+_ASSET=""
 parse_target() {  # CMDNAME [--app APP | --all]
   local cmd="$1"; shift
   local app="" all=0
@@ -213,27 +218,55 @@ cmd_update() {
 }
 
 # ---------------------------------------------------------------- install ----
-_do_install() {  # repo tag ver asset tmp
-  local repo="$1" latest="$2" ver="$3" asset="$4" tmp="$5"
-  local app; app="$(repo_basename "$repo")"
+pick_asset() {  # repo tag -> tarball asset name on stdout
+  local repo="$1" tag="$2" app ver exact pick
+  app="$(repo_basename "$repo")"; ver="${tag#v}"
+  local names
+  names="$(gh release view "$tag" -R "$repo" --json assets --jq '.assets[].name' 2>/dev/null || true)"
+  [[ -n "$names" ]] || { err_ "$repo: could not list the assets of release $tag"; return 1; }
 
-  gum_spin --spinner dot --title "Downloading $asset ..." -- \
-    gh release download "$latest" -R "$repo" -p "$asset" -p "SHA256SUMS.txt" -D "$tmp" \
-    || { err_ "$repo: download failed"; return 1; }
-  [[ -f "$tmp/$asset" ]] || { err_ "$repo: asset '$asset' not found in release $latest"; return 1; }
-
-  if [[ -f "$tmp/SHA256SUMS.txt" ]]; then
-    ( cd "$tmp" && awk -v f="$asset" '$2==f' SHA256SUMS.txt | sha256sum -c - >/dev/null ) \
-      || { err_ "$app: checksum verification FAILED — not installing"; return 1; }
-    info_ "$app: checksum verified"
-  else
-    warn_ "$app: SHA256SUMS.txt missing — skipping checksum verification"
+  # The asset name is not derivable from the repo name (craft-launcher publishes
+  # artcraft-launcher-...), so read the release instead of composing a filename.
+  exact="${app}-${ver}-${ARCH}.tar.gz"
+  if printf '%s\n' "$names" | grep -qxF "$exact"; then printf '%s\n' "$exact"; return 0; fi
+  pick="$(printf '%s\n' "$names" | grep -E -- "-${ver}-${ARCH}\.tar\.gz$" | grep -v -- '-cli-' | head -1)"
+  if [[ -z "$pick" ]]; then
+    err_ "$repo: no ${ver} ${ARCH} tarball in release $tag"
+    err_ "available assets: $(printf '%s\n' "$names" | tr '\n' ' ')"
+    return 1
   fi
+  printf '%s\n' "$pick"
+}
+
+_stage_release() {  # repo tag tmp -> verified tree in $tmp/x, asset name in _ASSET
+  local repo="$1" tag="$2" tmp="$3" app sum
+  app="$(repo_basename "$repo")"
+
+  _ASSET="$(pick_asset "$repo" "$tag")" || return 1
+  gum_spin --spinner dot --title "Downloading $_ASSET ..." -- \
+    gh release download "$tag" -R "$repo" -p "$_ASSET" -D "$tmp" \
+    || { err_ "$repo: download failed"; return 1; }
+  gh release download "$tag" -R "$repo" -p 'SHA256SUMS.txt' -D "$tmp" >/dev/null 2>&1 || true
+
+  # An unverified binary is not installed: the release either carries a checksum
+  # for this asset or the install stops here.
+  [[ -f "$tmp/SHA256SUMS.txt" ]] \
+    || { err_ "$app: release $tag ships no SHA256SUMS.txt; refusing to install unverified"; return 1; }
+  sum="$(awk -v f="$_ASSET" '$2 == f' "$tmp/SHA256SUMS.txt")"
+  [[ -n "$sum" ]] || { err_ "$app: no checksum entry for $_ASSET in SHA256SUMS.txt"; return 1; }
+  ( cd "$tmp" && printf '%s\n' "$sum" | sha256sum -c - >/dev/null ) \
+    || { err_ "$app: checksum verification FAILED - not installing"; return 1; }
+  info_ "$app: checksum verified"
 
   mkdir -p "$tmp/x"
-  tar xzf "$tmp/$asset" -C "$tmp/x" --strip-components=1 \
+  tar xzf "$tmp/$_ASSET" -C "$tmp/x" --strip-components=1 \
     || { err_ "$app: extraction failed"; return 1; }
   [[ -d "$tmp/x/bin" ]] || { err_ "$app: tarball has no bin/ directory"; return 1; }
+}
+
+_install_staged() {  # repo ver tmp -> copy the staged tree into place, record state
+  local repo="$1" ver="$2" tmp="$3" app
+  app="$(repo_basename "$repo")"
 
   mkdir -p "$BIN_DIR" "$SHARE_DIR" "$STATE_DIR"
   cp -a "$tmp/x/bin/." "$BIN_DIR/"
@@ -242,25 +275,21 @@ _do_install() {  # repo tag ver asset tmp
 
   # manifest of installed files (absolute paths) so uninstall is exact
   : > "$STATE_DIR/$app.files"
-  if [[ -d "$tmp/x/bin" ]]; then
-    ( cd "$tmp/x" && find bin -type f -printf "$BIN_DIR/%P\n" ) >> "$STATE_DIR/$app.files"
-  fi
+  ( cd "$tmp/x" && find bin -type f -printf "$BIN_DIR/%P\n" ) >> "$STATE_DIR/$app.files"
   if [[ -d "$tmp/x/share" ]]; then
     ( cd "$tmp/x" && find share -type f -printf "$SHARE_DIR/%P\n" ) >> "$STATE_DIR/$app.files"
   fi
   printf '%s\n' "$ver" > "$STATE_DIR/$app"
 
   _desktop_db_refresh
-  return 0
 }
 
 install_one() {  # owner/repo
-  local repo="$1" app latest ver asset tmp
+  local repo="$1" app latest ver tmp
   app="$(repo_basename "$repo")"
   latest="$(latest_tag "$repo")"
   [[ -n "$latest" ]] || { err_ "$repo: no stable release found"; return 1; }
   ver="${latest#v}"
-  asset="${app}-${ver}-${ARCH}.tar.gz"
 
   if is_installed "$app"; then
     err_ "$app: already installed (version $(installed_version "$app" 2>/dev/null || echo '?')) — use 'artcraftctl upgrade'"
@@ -268,7 +297,7 @@ install_one() {  # owner/repo
   fi
 
   tmp="$(mktemp -d)"
-  if _do_install "$repo" "$latest" "$ver" "$asset" "$tmp"; then
+  if _stage_release "$repo" "$latest" "$tmp" && _install_staged "$repo" "$ver" "$tmp"; then
     rm -rf "$tmp"; ok_ "$app: installed $ver -> $BIN_DIR/$app"; return 0
   fi
   rm -rf "$tmp"; return 1
@@ -284,7 +313,9 @@ cmd_install() {
 
 # -------------------------------------------------------------- uninstall ----
 _remove_files() {  # APP -> print the paths it removed
-  local app="$1" manifest="$STATE_DIR/$app.files" f
+  local app="$1" f
+  # two statements on purpose: in a single `local`, $app would still be unset here
+  local manifest="$STATE_DIR/$app.files"
   if [[ -f "$manifest" ]]; then
     while IFS= read -r f || [[ -n "$f" ]]; do
       [[ -z "$f" ]] && continue
@@ -323,26 +354,39 @@ cmd_uninstall() {
 
 # ---------------------------------------------------------------- upgrade ----
 upgrade_one() {  # owner/repo
-  local repo="$1" app latest inst
+  local repo="$1" app tag inst ver tmp
   app="$(repo_basename "$repo")"
-  latest="$(latest_tag "$repo")"
-  [[ -n "$latest" ]] || { err_ "$repo: no stable release found"; return 1; }
-  latest="${latest#v}"
+  tag="$(latest_tag "$repo")"
+  [[ -n "$tag" ]] || { err_ "$repo: no stable release found"; return 1; }
+  ver="${tag#v}"
 
   if ! is_installed "$app"; then
     info_ "$app: not installed — use 'artcraftctl install --app $app'"; return 0
   fi
   inst="$(installed_version "$app" || true)"
-  if [[ -n "$inst" && "$inst" == "$latest" ]]; then
+  if [[ -n "$inst" && "$inst" == "$ver" ]]; then
     ok_ "$app: already up to date ($inst)"; return 0
   fi
-  if [[ -n "$inst" ]] && ! ver_gt "$latest" "$inst"; then
-    ok_ "$app: installed $inst is newer than the latest release ($latest) — nothing to do"; return 0
+  if [[ -n "$inst" ]] && ! ver_gt "$ver" "$inst"; then
+    ok_ "$app: installed $inst is newer than the latest release ($ver) — nothing to do"; return 0
   fi
 
-  info_ "$app: upgrading ${inst:-?} -> $latest"
-  uninstall_one "$repo" --quiet || { err_ "$app: could not remove the old version"; return 1; }
-  install_one "$repo" || { err_ "$app: upgrade FAILED after removing the old version"; return 1; }
+  info_ "$app: upgrading ${inst:-?} -> $ver"
+  # Stage first. A failed download, a missing checksum or a bad tarball must leave
+  # the installed version exactly as it was, so the removal happens only after the
+  # replacement is verified and unpacked.
+  tmp="$(mktemp -d)"
+  if ! _stage_release "$repo" "$tag" "$tmp"; then
+    rm -rf "$tmp"; err_ "$app: upgrade aborted, the installed version was left in place"; return 1
+  fi
+  if ! uninstall_one "$repo" --quiet; then
+    rm -rf "$tmp"; err_ "$app: could not remove the old version"; return 1
+  fi
+  if ! _install_staged "$repo" "$ver" "$tmp"; then
+    rm -rf "$tmp"; err_ "$app: files could not be installed after the old version was removed"; return 1
+  fi
+  rm -rf "$tmp"
+  ok_ "$app: upgraded to $ver"
 }
 
 cmd_upgrade() {
