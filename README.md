@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/artcraftctl.png" alt="artcraftctl" width="996">
+</p>
+
 # artcraftctl
 
 `artcraftctl` installs and updates the ArtCraft suite: the apps in the
