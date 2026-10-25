@@ -1,0 +1,18 @@
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# editor and shell noise
+*~
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# patch leftovers
+*.orig
+*.rej
+
+# local sandbox prefix for testing with the ARTCRAFT_* overrides
+.sandbox/
+scratch/
