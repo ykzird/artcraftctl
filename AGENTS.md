@@ -52,6 +52,11 @@ real entrypoint in a fresh sandbox per case. 15 cases cover install/update/upgra
 two failure modes below, checksum and arch refusal, the manifest prefix guard, and the no-tty path.
 `bash tests/run.sh rollback` runs only the matching cases. Exit 0 means every case passed.
 
+`bash tests/mutation-check.sh` proves the suite has teeth: it removes one guard at a time from a
+copy of `artcraftctl` and requires a named case to fail. Dev-only, not a gate — run it whenever the
+install, rollback or prune logic changes, because a case that passes for the wrong reason looks
+exactly like a case that passes for the right one.
+
 Against real releases (needs `gh auth status` to be logged in), the manual recipe is still the
 honest end-to-end check:
 
